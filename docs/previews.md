@@ -17,7 +17,7 @@ The open command waits briefly for the helper, then returns pending rather than 
 
 ## Machines without inbound SSH
 
-Write `previews/setup.json` with `"tunnel": true` and no SSH fields. Pairing then returns `{"tunnel":true}`. The helper opens each preview connection as `GET /v1/previews/PORT/tunnel?device=ID` with `Upgrade: websocket` and the core bearer token; cores before 0.1.35 answer that with `400`, so the helper retries with `Upgrade: cloudroom-tunnel`. Either name opens the same raw tunnel, with no WebSocket frames: the `websocket` name only gets it through proxies that relay nothing else. Core rechecks the device, the registration, and the agent's listener, answers `101`, and joins the connection to `127.0.0.1:PORT`. Closing a preview or revoking the device ends its tunnels. Mac access uses the same pairing.
+Write `previews/setup.json` with `"tunnel": true` and no SSH fields. Pairing then returns `{"tunnel":true}`. The helper opens each preview connection as `GET /v1/previews/PORT/tunnel?device=ID` with `Upgrade: websocket` and the core bearer token; cores before 0.1.35 answer that with `400`, so the helper retries with `Upgrade: cloudroom-tunnel`. This handshake and every control request carry `User-Agent: Cloudroom-Helper`, because proxies such as Cloudflare refuse urllib's default. A User-Agent the caller supplies replaces it; on both paths header names match case-insensitively and the last value wins, as in urllib. Either name opens the same raw tunnel, with no WebSocket frames: the `websocket` name only gets it through proxies that relay nothing else. Core rechecks the device, the registration, and the agent's listener, answers `101`, and joins the connection to `127.0.0.1:PORT`. Closing a preview or revoking the device ends its tunnels. Mac access uses the same pairing.
 
 ## Ownership
 
@@ -80,6 +80,6 @@ The narrow Unix socket exposes only registration/status/close. Kernel peer crede
 
 ## Verification
 
-Run `python3 tests/preview_client.py` for real HTTP/Unix-socket proxy regressions. On a disposable Linux machine with OpenSSH and a built core, run `sudo python3 tests/previews_ssh.py --disposable`: it checks the agent CLI, destination ownership, restricted SSH and active revocation. It refuses machines with existing Cloudroom accounts. Both are wired into CI alongside Rust and existing checks.
+Run `python3 tests/preview_client.py` for real HTTP/Unix-socket proxy regressions. It also drives the helper through a local TLS edge proxy that emulates the Cloudflare rule reported in #38 (it refuses urllib's default User-Agent), using a throwaway CA from `openssl`; no network beyond loopback. On a disposable Linux machine with OpenSSH and a built core, run `sudo python3 tests/previews_ssh.py --disposable`: it checks the agent CLI, destination ownership, restricted SSH and active revocation. It refuses machines with existing Cloudroom accounts. Both are wired into CI alongside Rust and existing checks.
 
 Before rollout, verify browsers, real development-server live reload, streaming, uploads, occupied ports, reconnect and sign-out. macOS 26 supports `.localhost` in Safari; older supported systems need separate verification. A source build changes no production configuration.
