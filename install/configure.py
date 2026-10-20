@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Configure a preinstalled core from private JSON on stdin. Never log that JSON."""
+import ipaddress
 import json
 import os
 from pathlib import Path
 import pwd
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from urllib.parse import urlsplit
 
 CODE_ROOT = Path('/code')
 CACHE_ROOT = Path('/var/cache/cloudroom-agent')
+HOST = re.compile(r'[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*')
 
 
 def accounts():
@@ -49,16 +52,34 @@ def installed_version():
     return output.split()[1]
 
 
+def managed_api(url):
+    # Core's own rule (src/config.rs) for CLOUDROOM_API_URL, minus its loopback test servers, plus a usable host and port.
+    if not (isinstance(url, str) and url.startswith('https://') and not url.endswith('/')
+            and all(33 <= ord(c) < 127 and c not in '?#@' for c in url)):
+        return False
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+        host = parts.hostname or ''
+        if '[' in parts.netloc:  # A bracketed host must be an IPv6 address, not an IPvFuture literal.
+            return bool(ipaddress.IPv6Address(host))
+        last = host.rsplit('.', 1)[-1]
+        if last.isdigit() or last.startswith('0x'):  # URL parsers read such hosts as IPv4 addresses.
+            return bool(ipaddress.IPv4Address(host))
+        return bool(HOST.fullmatch(host))
+    except ValueError:
+        return False
+
+
 def configure(data, directory=Path('/etc/cloudroom')):
     if os.geteuid() != 0:
         raise ValueError('Run as the provisioning administrator')
-    # apiUrl (ADR 0232) is where a new Core saves history; older setup requests don't send it.
+    # apiUrl (ADR 0232) is where a new Core saves history; older retries of an existing setup don't send it.
     if not isinstance(data, dict) or set(data) - {'apiUrl'} != {'userId', 'coreToken', 'databaseUrl', 'release'}:
         raise ValueError('Unexpected setup fields')
     api = data.get('apiUrl')
-    if api is not None and (not isinstance(api, str) or not api.startswith('https://') or api.endswith('/')
-                            or any(ord(c) <= 32 or ord(c) == 127 or c in '?#@' for c in api)):
-        raise ValueError('apiUrl must be an https:// URL without a trailing slash')
+    if api is not None and not managed_api(api):
+        raise ValueError('apiUrl must be an https:// URL with a host and no trailing slash')
     owner, token, database, release = (data[k] for k in ('userId', 'coreToken', 'databaseUrl', 'release'))
     if not all(isinstance(v, str) for v in (owner, token, database, release)):
         raise ValueError('Setup fields must be strings')
@@ -77,23 +98,38 @@ def configure(data, directory=Path('/etc/cloudroom')):
     path = directory / 'core.env'
     if not directory.is_absolute() or directory.is_symlink() or path.is_symlink():
         raise ValueError('Configuration paths must not be symlinks')
+    # Reruns never replace settings, rotate credentials, or restart existing workloads.
+    existing = path.exists()
+    if existing:
+        # systemd splits only on newlines; any other separator stays inside the value and fails the checks below.
+        with path.open(newline='') as file:
+            previous = dict(line.split('=', 1) for line in file.read().split('\n') if '=' in line)
+        if any(previous.get(k) != json.dumps(v, ensure_ascii=False) for k, v in {
+            'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database,
+            **({'CLOUDROOM_API_URL': api} if 'apiUrl' in data else {}),
+        }.items()):
+            raise ValueError('Existing configuration differs; no changes made')
+        raw = previous.get('CLOUDROOM_API_URL', 'null')
+        try:
+            saved = json.loads(raw)
+        except (ValueError, RecursionError):
+            saved = None
+        # Core refuses to start without a history destination; never repair it or fall back to local-only history.
+        # Only the exact form written below is trusted: systemd does not decode JSON escapes such as \/.
+        if not managed_api(saved) or raw != json.dumps(saved):
+            raise ValueError('Existing configuration has no valid API destination; no changes made')
+    elif api is None:
+        raise ValueError('apiUrl is required for a new managed setup')
     directory.mkdir(mode=0o750, exist_ok=True)
     os.chown(directory, 0, service.pw_gid)
     directory.chmod(0o750)
-    # Reruns never replace settings, rotate credentials, or restart existing workloads.
-    if path.exists():
-        previous = dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
-        if any(previous.get(k) != json.dumps(v, ensure_ascii=False) for k, v in {
-            'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database
-        }.items()):
-            raise ValueError('Existing configuration differs; no changes made')
-    else:
+    if not existing:
         settings = {
             'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database,
             'CLOUDROOM_LISTEN': os.environ.get('CLOUDROOM_LISTEN', '127.0.0.1:9840'), 'CLOUDROOM_ACCOUNT_HOME': agent.pw_dir,
             'CLOUDROOM_STATE_DIR': str(Path(service.pw_dir) / 'history'),
             'CLOUDROOM_STORAGE_POLICY': str(directory / 'storage.json'),
-            **({'CLOUDROOM_API_URL': api} if api else {}),
+            'CLOUDROOM_API_URL': api,
         }
         if os.environ.get('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP') == '1':
             settings['CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP'] = '1'
