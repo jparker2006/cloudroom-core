@@ -16,7 +16,7 @@ One internal module; no alerts, external collector, or new dependency. Diagnosti
 - `storage_stale`: the disk guard loop measured more than five seconds late; `gap_ms` is how long. Recorded only during stalls.
 - `diagnostics`: cumulative dropped-record, local-write-failure and upload-failure counts for this process.
 
-Ordinary local/uploaded diagnostics contain only fixed diagnostic fields and correlation IDs. No credentials, prompts, native history, filesystem paths, request bodies or raw URLs. The separate, protected stderr capture below is the only raw-output exception. History and recovery remain with their existing owners.
+Ordinary local/uploaded diagnostics contain only fixed diagnostic fields and correlation IDs. No credentials, prompts, native history, filesystem paths, request bodies or raw URLs. The separate, protected stderr capture and its bounded owner-visible crash tail (below) are the only raw-output exceptions. History and recovery remain with their existing owners.
 
 ## Storage and limits
 
@@ -42,14 +42,16 @@ Inspect the existing `cloudroom_diagnostics` table with the owner-scoped query i
 
 ## Protected harness stderr
 
-Raw stderr is untrusted and may contain credentials, prompts or private paths. It never enters ordinary logs, uploads, session history, API responses or SSE. Only the protected service account and authorized administrators should inspect it; the core token does not grant access. Do not automatically include it in support bundles or share it without reviewing/redacting it.
+Raw stderr is untrusted and may contain credentials, prompts or private paths. The protected capture record never enters ordinary logs, diagnostic uploads, session history, API responses or SSE. Only the separate crash tail below reaches session history, the API and SSE (never ordinary logs or diagnostic uploads), and for short stderr it can repeat every non-blank line of the capture. Only the protected service account and authorized administrators should inspect the capture record; the core token does not grant access. Do not automatically include it in support bundles or share it without reviewing/redacting it.
 
 - Runtime continuously drains each process in 8 KiB chunks, retaining only the last **16 KiB**. Capture uses bytes, not lines. After workload cleanup it waits at most **250 ms** for EOF, then cancels and joins the reader. `stderr_complete: false` means the reader failed or timed out; `stderr_truncated: true` means earlier bytes were discarded. Neither changes recovery behavior.
-- Nonempty tails are saved once at exit, including graceful exits and startup/resume/model-discovery failures. Errors before a process is spawned have no stderr capture. A still-running process's tail stays in memory; abrupt core termination loses it.
+- Nonempty tails are saved once at exit, including graceful exits, startup/resume failures and Codex/Claude model discovery. Cursor model discovery discards its stderr, so it has none. Errors before a process is spawned have no stderr capture. A still-running process's tail stays in memory; abrupt core termination loses it.
 - The existing Observability worker consumes a separate **32-capture**, nonblocking queue in batches of at most **8**. Overflow increments `dropped`; private write failures increment `local_write_failures`. Disk/database failures do not backpressure execution. Capture is best-effort, not a durable outbox.
 - Files: `$CLOUDROOM_STATE_DIR/harness-diagnostics/stderr.jsonl` and `stderr.previous.jsonl`. Directory **0700**, files **0600**, service-owned. Unsafe existing directories, links, special files, hardlinks or permissions are rejected, never repaired or redirected into ordinary logs. The state directory must already be trusted and protected from agent replacement.
 - Rotation counts encoded bytes and strictly caps each file at **1 MiB**. Retention is size-based, not age-based: quiet machines retain captures until overwritten or explicitly removed. Restart does not erase them. VM snapshots/operator backups can retain additional copies; there is no automatic upload or sync of these files.
 - Private records share the ordinary exit record's `run_id` and `sequence`. Invalid UTF-8 is replaced only when writing JSON; capture is not a byte-exact archive. Avoid raw terminal output: JSON escaping protects against control sequences, and `jq -a` also escapes Unicode controls.
+
+**Exception: the owner-visible crash tail** (ADR 0123). It is not protected by the rules above. When a session ends `failed` or `process_lost`, Session Management takes the last **2000 bytes** of the captured stderr, keeps the last **20 non-blank lines** (the first may be a partial line cut at the byte boundary), and stores them unredacted as `stderr` in that session's `state` record. Decoding is lossy: a character cut at the 2000-byte boundary, or other invalid UTF-8, becomes `�`. Like any history record it reaches whoever can read the session, including core-token holders, through the session API, SSE and saved history, and in uploaded history when an API is configured. Other exits and model discovery show no tail. Treat it as unreviewed stderr: it can still contain secrets, so redact it before sharing.
 
 As the protected service account, inspect a session without decoding raw terminal controls:
 
@@ -83,4 +85,4 @@ GROUP BY 1, 2;
 
 ## Verify
 
-Run `cargo test --locked --all-targets` and, after building, `python3 tests/core_fixture.py` for stderr capture, exit races, bounded queues, permissions/rotation, and HTTP/history exclusion. Run `python3 tests/core_e2e.py --foundation` for HTTP, real Linux resource sampling, migration recovery, redaction, retention and browser-role denial. Full `tests/core_e2e.py` additionally checks real Codex startup/crash signals and local diagnostics while history storage is unavailable. Use only disposable test resources; these checks do not deploy or migrate production.
+Run `cargo test --locked --all-targets` and, after building, `python3 tests/core_fixture.py` for stderr capture, exit races, bounded queues, permissions/rotation, the bounded crash tail in session records, and keeping it out of capabilities, the dashboard, ordinary diagnostics and the service log (uploaded history is not checked). Run `python3 tests/core_e2e.py --foundation` for HTTP, real Linux resource sampling, migration recovery, redaction, retention and browser-role denial. Full `tests/core_e2e.py` additionally checks real Codex startup/crash signals and local diagnostics while history storage is unavailable. Use only disposable test resources; these checks do not deploy or migrate production.
