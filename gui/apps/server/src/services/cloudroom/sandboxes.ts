@@ -13,7 +13,7 @@ import { z } from "zod";
 import { hasSupportedFrontmatterDelimiter, parseFrontmatter } from "../skills/injected-skills.js";
 import { macClaudeSignedIn } from "./claude-token.js";
 import { CloudroomConnectionError, CloudroomError } from "./client.js";
-import { macHarnessVersions } from "./harness-versions.js";
+import { lastMacHarnessVersions, macHarnessVersions, versionOf } from "./harness-versions.js";
 import { cancelMcpSignIns, isRemoteMcp, mcpSignInKey, needsMcpSignIn, type McpSignIn, type RemoteMcpServer } from "./mcp-login.js";
 
 export const SANDBOX_PREFIX = "sandbox:";
@@ -177,7 +177,8 @@ function contentDigest(tar: Buffer): string {
  *  kept byte for byte so a sandbox's unchanged export matches it (ADR 0172). */
 export async function macOpencodeLogin(): Promise<string | null> {
   const binary = findCliExecutable("opencode");
-  const version = (await macHarnessVersions()).opencode;
+  // Login copies and checks run on launch, so only OpenCode's own version, never every agent CLI (#96).
+  const version = await versionOf(binary);
   const value = binary && version && !version.startsWith("1.")
     ? (await execPortableFile(binary, ["auth", "export", "--standalone"], { timeoutMs: 20_000, maxBuffer: 1024 * 1024 }).catch(() => null))?.stdout ?? null
     : await readFile(join(process.env.XDG_DATA_HOME || join(homedir(), ".local/share"), "opencode/auth.json"), "utf8").catch(() => null);
@@ -672,8 +673,9 @@ export class SandboxDirectory {
     let pending = this.wakes.get(thread);
     if (!pending) {
       this.wakeStarts.set(thread, Date.now());
-      // The Mac's harness versions: the sandbox upgrades to them before its agent starts (ADR 0133).
-      pending = macHarnessVersions().then(harnesses => {
+      // The Mac's harness versions: the sandbox upgrades to them before its agent starts (ADR 0133). A view wake also
+      // fires on launch and focus, so it sends the last versions read instead of running the CLIs (#96).
+      pending = (trigger === "thread_view" ? lastMacHarnessVersions() : macHarnessVersions()).then(harnesses => {
         this.wakeHarnesses.set(thread, harnesses);
         const target = this.targets.get(thread), from = this.keySource(thread);
         return this.call({ action: "wake", ...place, ...(target ? { target } : {}), ...(from ? { from } : {}), harnesses, ...(this.backoff.has(thread) ? { trigger: "retry" } : trigger ? { trigger } : {}) });
@@ -760,7 +762,8 @@ export class SandboxDirectory {
 
   private preloadOne(thread: string, project: SandboxProject): Promise<void> {
     this.wakeStarts.set(thread, Date.now());
-    const run = macHarnessVersions().then(harnesses => {
+    // Preloads are automatic: the last versions read, never the CLIs (#96).
+    const run = lastMacHarnessVersions().then(harnesses => {
       this.wakeHarnesses.set(thread, harnesses);
       return this.call({ action: "wake", ...placeOf(thread, project), harnesses, trigger: "sidebar_preload" });
     }).then(value => this.woke(this.remember(viewSchema.parse(value)).thread)).catch(() => {}).finally(() => this.preloads.delete(thread));
@@ -834,7 +837,8 @@ export class SandboxDirectory {
   async warm(project: SandboxProject, trigger: SandboxTrigger = "composer"): Promise<void> {
     if (this.warmed?.project === project.id && Date.now() - this.warmed.at < RECHECK_MS) return;
     this.warmed = { project: project.id, at: Date.now() };
-    await this.call({ action: "warm", project: project.id, trigger, ...(project.repository ? { repository: project.repository, folder: project.folder } : {}), harnesses: await macHarnessVersions() });
+    // Spares warm on launch and activity: the last versions read, never the CLIs (#96).
+    await this.call({ action: "warm", project: project.id, trigger, ...(project.repository ? { repository: project.repository, folder: project.folder } : {}), harnesses: await lastMacHarnessVersions() });
   }
 
   /** Forgets what was learned under the last account: sandbox tokens, uploaded logins and config, and its settings. */
