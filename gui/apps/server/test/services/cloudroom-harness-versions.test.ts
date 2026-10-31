@@ -98,3 +98,23 @@ it("prewarms, preloads, and view wakes run no CLI; a wake for work does, and lat
     expect(await ran()).toEqual([]);
   } finally { server.close(); }
 });
+
+// With #97, findCliExecutable("codex") is null when the only Codex is in Codex.app, even through a PATH symlink. A bare
+// `codex` fallback would still reach it through the OS PATH lookup, here the fake on PATH.
+it("Codex sign-in and its expiry check never run a bare `codex` when no Codex is found", async () => {
+  vi.doMock("@cloudroom/process-utils", async (original) => {
+    const utils = await original<typeof import("@cloudroom/process-utils")>();
+    return { ...utils, findCliExecutable: (cli: string, env?: NodeJS.ProcessEnv) => cli === "codex" ? null : utils.findCliExecutable(cli, env) };
+  });
+  try {
+    const { macCodexLoginExpired, startMacCodexLogin } = await import("../../src/services/cloudroom/sandboxes.js");
+    const run = startMacCodexLogin();
+    await vi.waitFor(() => expect(run.done).toBe(true));
+    expect(await ran()).toEqual([]);
+    expect(run.error).toMatch(/^Codex is not installed/);
+    const expired = `x.${Buffer.from(JSON.stringify({ exp: 1 })).toString("base64url")}.x`;
+    await writeFile(join(dir, "auth.json"), JSON.stringify({ tokens: { access_token: expired } }));
+    expect(await macCodexLoginExpired()).toBe(false);
+    expect(await ran()).toEqual([]);
+  } finally { vi.doUnmock("@cloudroom/process-utils"); }
+});
