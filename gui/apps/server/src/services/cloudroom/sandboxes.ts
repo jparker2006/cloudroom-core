@@ -1306,7 +1306,7 @@ export class SandboxDirectory {
   }
 
   /** A broken stream or failed request may mean the sandbox went to sleep; look it up again next time. */
-  forget(thread: string): void { this.views.delete(thread); this.awake.delete(thread); }
+  forget(thread: string): void { this.views.delete(thread); this.awake.delete(thread); this.awakeNext = 0; }
   /** What the website says the thread's sandbox is doing. Never wakes it; the answer isn't kept. */
   async state(thread: string): Promise<View["state"]> { return viewSchema.parse(await this.call({ action: "lookup", thread })).state; }
 

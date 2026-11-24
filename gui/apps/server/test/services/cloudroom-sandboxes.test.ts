@@ -1205,3 +1205,52 @@ it("Mac-only MCP programs like xcrun stay on this Mac (#1244)", async () => {
     expect(found).toEqual({ xcode: true, build: true, apple: true, npx: false, xcrunner: false, remote: false });
   } finally { vi.unstubAllEnvs(); await rm(dir, { recursive: true, force: true }); }
 });
+
+it("forgetting a sandbox re-checks the awake list instead of treating a fresh cache miss as asleep", async () => {
+  const harness = await createTestAppHarness();
+  const service = cloudroom(harness.deps);
+  const token = "t".repeat(64);
+  const coreUrl = "http://127.0.0.1:41234";
+  const project = { id: "proj_1", repository: null, folder: "proj" };
+  let awakeCalls = 0;
+  const websiteServer = createServer(async (req, res) => {
+    const input = await body(req);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.url === "/api/desktop/logins") return res.end(JSON.stringify({ claude: false, codex: false, pi: false, github: false }));
+    if (input.action === "awake") {
+      awakeCalls++;
+      return res.end(JSON.stringify({
+        sandboxes: [
+          { thread: "thr_awake", origin: coreUrl, token },
+          { thread: "thr_other", origin: coreUrl, token },
+        ],
+        recheck_ms: 60_000,
+      }));
+    }
+    res.end(JSON.stringify({ thread: input.thread, state: "asleep", generation: 1, issue: null }));
+  });
+  const websiteUrl = await listen(websiteServer);
+  try {
+    await service.configure(null, { id: "11111111-1111-4111-8111-111111111111", email: "sandbox@example.com" }, undefined, websiteUrl, "a".repeat(64));
+    expect(await service.sandboxes.connection("thr_awake", project, false)).toEqual({ url: coreUrl, token });
+    const afterFirst = awakeCalls;
+    expect(afterFirst).toBeGreaterThanOrEqual(1);
+
+    service.sandboxes.forget("thr_awake");
+    expect(await service.sandboxes.connection("thr_awake", project, false)).toEqual({ url: coreUrl, token });
+    expect(awakeCalls).toBe(afterFirst + 1);
+
+    // Concurrent lookups after multiple forgets share one in-flight awake-list request.
+    service.sandboxes.forget("thr_awake");
+    service.sandboxes.forget("thr_other");
+    const [first, second] = await Promise.all([
+      service.sandboxes.connection("thr_awake", project, false),
+      service.sandboxes.connection("thr_other", project, false),
+    ]);
+    expect([first, second]).toEqual([{ url: coreUrl, token }, { url: coreUrl, token }]);
+    expect(awakeCalls).toBe(afterFirst + 2);
+  } finally {
+    service.stop();
+    websiteServer.close();
+  }
+});
